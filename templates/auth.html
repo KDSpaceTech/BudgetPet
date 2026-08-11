@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#7420c5">
+<title>BudgetPet • Đăng nhập</title>
+<style>
+:root{--purple:#7d20c8;--purple2:#a238f3;--bg:#f4f5f9;--text:#20243a;--muted:#7b8194}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:linear-gradient(180deg,#f5f6fb,#eceef5);color:var(--text)}
+body{display:flex;justify-content:center;padding:20px 12px 30px}.auth-app{width:min(560px,100%);min-height:calc(100vh - 50px);display:flex;align-items:center}.auth-card{width:100%;background:#fff;border:1px solid #e5e7ef;border-radius:24px;box-shadow:0 20px 60px rgba(68,25,100,.12);overflow:hidden}.hero{background:linear-gradient(135deg,#8a24d4,#6118a6);color:#fff;padding:28px 22px 24px}.brand-row{display:flex;align-items:center;gap:12px}.logo{width:52px;height:52px;border-radius:17px;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);display:grid;place-items:center;font-size:28px}.brand{font-weight:900;font-size:21px}.badge{font-size:9px;font-weight:800;background:#43118a;padding:5px 8px;border-radius:7px;margin-left:5px}.sub{font-size:12px;opacity:.88;margin-top:4px}.body{padding:20px}.tabs{display:grid;grid-template-columns:1fr 1fr;background:#f0eff5;border-radius:13px;padding:4px;gap:4px;margin-bottom:17px}.tab{padding:10px;border-radius:10px;background:transparent;color:#7b8194;font-weight:800;font-size:12px}.tab.active{background:#fff;color:#7621c4;box-shadow:0 2px 8px rgba(70,40,90,.08)}.form{display:none}.form.active{display:block}.field{margin-bottom:12px}.field label{display:block;font-size:11px;font-weight:800;margin:0 0 6px 2px}.field input{width:100%;padding:12px 13px;border:1px solid #dfe2eb;border-radius:12px;outline:none;font-size:13px;background:#fff}.field input:focus{border-color:#9a37eb;box-shadow:0 0 0 3px rgba(154,55,235,.1)}.primary{width:100%;padding:13px;border:0;border-radius:13px;background:linear-gradient(90deg,#a238f3,#8222d5);color:#fff;font-weight:900;cursor:pointer;margin-top:4px}.hint{text-align:center;color:var(--muted);font-size:10px;line-height:1.5;margin-top:13px}.error{display:none;background:#fff0f1;color:#c73542;border:1px solid #ffd2d6;border-radius:11px;padding:10px;font-size:11px;margin-bottom:12px}.error.show{display:block}.demo{margin-top:15px;background:#f7f1ff;border:1px solid #e8d8f8;border-radius:13px;padding:11px;font-size:10px;color:#745783;line-height:1.5}.demo b{color:#7621c4}.loading{opacity:.65;pointer-events:none}@media(max-width:420px){body{padding:10px}.auth-app{min-height:calc(100vh - 20px)}.hero{padding:23px 18px}.body{padding:17px}}
+</style>
+</head>
+<body>
+<div class="auth-app"><div class="auth-card">
+<section class="hero"><div class="brand-row"><div class="logo">🐾</div><div><div class="brand">BudgetPet <span class="badge">Gen Z MVP</span></div><div class="sub">Quản lý chi tiêu • Nuôi Pet • AI OCR 🐱</div></div></div></section>
+<section class="body">
+<div class="tabs"><button class="tab active" id="loginTab" onclick="switchMode('login')">Đăng nhập</button><button class="tab" id="registerTab" onclick="switchMode('register')">Đăng ký</button></div>
+<div id="error" class="error"></div>
+<form id="loginForm" class="form active" onsubmit="login(event)">
+<div class="field"><label>Tên đăng nhập</label><input id="loginUsername" autocomplete="username" required placeholder="VD: admin"></div>
+<div class="field"><label>Mật khẩu</label><input id="loginPassword" type="password" autocomplete="current-password" required placeholder="Nhập mật khẩu"></div>
+<button class="primary" id="loginBtn">🔐 Đăng nhập</button>
+<div class="hint">Dữ liệu BudgetPet của mỗi tài khoản được lưu riêng, không dùng chung với tài khoản khác.</div>
+</form>
+<form id="registerForm" class="form" onsubmit="register(event)">
+<div class="field"><label>Tên hiển thị</label><input id="registerDisplay" maxlength="40" required placeholder="VD: Khánh Duy"></div>
+<div class="field"><label>Tên đăng nhập</label><input id="registerUsername" maxlength="24" autocomplete="username" required placeholder="VD: admin • 3-24 ký tự"></div>
+<div class="field"><label>Mật khẩu</label><input id="registerPassword" type="password" minlength="6" autocomplete="new-password" required placeholder="Ít nhất 6 ký tự"></div>
+<div class="field"><label>Nhập lại mật khẩu</label><input id="registerConfirm" type="password" minlength="6" autocomplete="new-password" required placeholder="Nhập lại mật khẩu"></div>
+<button class="primary" id="registerBtn">✨ Tạo tài khoản</button>
+<div class="demo">Bản demo hỗ trợ tối đa <b>30 tài khoản</b>. Mỗi tài khoản có Pet, giao dịch, 6 Hũ, mục tiêu, hóa đơn định kỳ và ảnh đại diện riêng.</div>
+</form>
+</section></div></div>
+<script>
+function switchMode(mode){document.getElementById('loginTab').classList.toggle('active',mode==='login');document.getElementById('registerTab').classList.toggle('active',mode==='register');document.getElementById('loginForm').classList.toggle('active',mode==='login');document.getElementById('registerForm').classList.toggle('active',mode==='register');clearError()}
+function showError(msg){const e=document.getElementById('error');e.textContent=msg;e.classList.add('show')}
+function clearError(){document.getElementById('error').classList.remove('show');document.getElementById('error').textContent=''}
+async function post(path,payload,button){clearError();button?.classList.add('loading');try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});let j={};try{j=await r.json()}catch{}if(!r.ok||!j.success)throw new Error(j.error||`HTTP ${r.status}`);window.location.href='/'}catch(e){showError(e.message)}finally{button?.classList.remove('loading')}}
+function login(e){e.preventDefault();post('/api/login',{username:document.getElementById('loginUsername').value.trim(),password:document.getElementById('loginPassword').value},document.getElementById('loginBtn'))}
+function register(e){e.preventDefault();post('/api/register',{display_name:document.getElementById('registerDisplay').value.trim(),username:document.getElementById('registerUsername').value.trim(),password:document.getElementById('registerPassword').value,confirm_password:document.getElementById('registerConfirm').value},document.getElementById('registerBtn'))}
+</script>
+</body></html>

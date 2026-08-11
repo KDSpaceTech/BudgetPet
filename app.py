@@ -8,6 +8,11 @@ import re
 import socket
 import http.server
 import socketserver
+import threading
+import secrets
+import hashlib
+import hmac
+from http.cookies import SimpleCookie
 from pathlib import Path
 from datetime import datetime
 from email.parser import BytesFeedParser
@@ -19,17 +24,28 @@ from email.policy import default
 
 PORT = int(os.environ.get("PORT", "3000"))
 
-# Gemini API key must be provided as an environment variable.
+# Gemini key is intentionally read only from the environment. Never commit the
+# real key to GitHub.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_DIR = BASE_DIR / "database"
 DB_DIR.mkdir(parents=True, exist_ok=True)
+USERS_DIR = DB_DIR / "users"
+USERS_DIR.mkdir(parents=True, exist_ok=True)
+AUTH_DB_FILE = Path(os.environ.get("AUTH_DB_FILE", str(DB_DIR / "auth.db")))
 
-# You can still override the database location with DB_FILE.
+# Demo target: at most 30 registered accounts.
+MAX_DEMO_USERS = 30
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
+PASSWORD_ITERATIONS = 220_000
+
+# The original single-user DB path is kept only as a legacy fallback for the
+# old helper functions. All authenticated requests use the current user's DB.
 DB_FILE = Path(os.environ.get("DB_FILE", str(DB_DIR / "budgetpet.db")))
-
 TEMPLATES_DIR = BASE_DIR / "templates"
+
+_REQUEST_CONTEXT = threading.local()
 
 
 def json_response(handler, data, status=200):
@@ -50,11 +66,258 @@ def text_response(handler, text, status=200, content_type="text/plain; charset=u
     handler.wfile.write(body)
 
 
-def get_connection():
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_FILE))
+def get_connection(db_file=None):
+    if db_file is None:
+        db_file = getattr(_REQUEST_CONTEXT, "db_file", None) or DB_FILE
+    db_file = Path(db_file)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_file), timeout=20)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 20000")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError:
+        pass
     return conn
+
+
+def current_user_id():
+    return getattr(_REQUEST_CONTEXT, "user_id", None)
+
+
+def current_user_db():
+    return getattr(_REQUEST_CONTEXT, "db_file", None)
+
+
+def clear_request_context():
+    for attr in ("user_id", "db_file"):
+        if hasattr(_REQUEST_CONTEXT, attr):
+            delattr(_REQUEST_CONTEXT, attr)
+
+
+def hash_password(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return salt.hex(), digest.hex()
+
+
+def verify_password(password, salt_hex, expected_hash):
+    _, actual = hash_password(password, salt_hex)
+    return hmac.compare_digest(actual, expected_hash)
+
+
+def get_auth_connection():
+    AUTH_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(AUTH_DB_FILE), timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 20000")
+    return conn
+
+
+def init_auth_db():
+    conn = get_auth_connection()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            user_db TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+    """)
+    conn.commit()
+    conn.close()
+
+
+def user_db_path(user_db):
+    path = (BASE_DIR / user_db).resolve()
+    users_root = USERS_DIR.resolve()
+    if users_root not in path.parents:
+        raise ValueError("Đường dẫn database người dùng không hợp lệ")
+    return path
+
+
+def create_user_database(path):
+    init_user_database(path)
+
+
+def init_user_database(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = get_connection(path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            month_year TEXT PRIMARY KEY,
+            monthly_limit REAL DEFAULT 3000000,
+            monthly_income REAL DEFAULT 5000000
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            amount INTEGER,
+            paid INTEGER,
+            icon TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jars (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            percentage INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            merchant TEXT,
+            title TEXT,
+            amount INTEGER,
+            time TEXT,
+            category TEXT DEFAULT 'Khác',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            target REAL NOT NULL DEFAULT 0,
+            current REAL NOT NULL DEFAULT 0,
+            icon TEXT DEFAULT '🎯',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    defaults = {
+        "pet_name": "Paws",
+        "pet_type": "cat",
+        "logo_image": "",
+        "display_name": "",
+    }
+    for key, value in defaults.items():
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+    cursor.execute("SELECT COUNT(*) AS count FROM bills")
+    if cursor.fetchone()["count"] == 0:
+        cursor.executemany(
+            "INSERT INTO bills (title, amount, paid, icon) VALUES (?, ?, ?, ?)",
+            [
+                ("Tiền Phòng Trọ", 2500000, 0, "home"),
+                ("Điện Nước", 320000, 1, "flash"),
+                ("Spotify Student", 29000, 1, "music"),
+                ("Internet Wifi", 110000, 0, "wifi"),
+            ],
+        )
+    cursor.execute("SELECT COUNT(*) AS count FROM jars")
+    if cursor.fetchone()["count"] == 0:
+        cursor.executemany(
+            "INSERT INTO jars (name, percentage) VALUES (?, ?)",
+            [
+                ("Nhu cầu thiết yếu", 55),
+                ("Giáo dục", 10),
+                ("Tiết kiệm", 0),
+                ("Tự do tài chính", 10),
+                ("Hưởng thụ", 10),
+                ("Từ thiện", 5),
+            ],
+        )
+    conn.commit()
+    conn.close()
+
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(48)
+    expires = int(datetime.now().timestamp()) + SESSION_TTL_SECONDS
+    conn = get_auth_connection()
+    conn.execute("INSERT INTO sessions(token, user_id, expires_at) VALUES (?, ?, ?)", (token, user_id, expires))
+    conn.commit()
+    conn.close()
+    return token, expires
+
+
+def delete_session(token):
+    if not token:
+        return
+    conn = get_auth_connection()
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def parse_cookie_token(handler):
+    cookie = SimpleCookie()
+    try:
+        cookie.load(handler.headers.get("Cookie", ""))
+        return cookie.get("budgetpet_session").value if cookie.get("budgetpet_session") else ""
+    except Exception:
+        return ""
+
+
+def session_user(handler):
+    token = parse_cookie_token(handler)
+    if not token:
+        return None
+    now = int(datetime.now().timestamp())
+    conn = get_auth_connection()
+    row = conn.execute("""
+        SELECT u.id, u.username, u.display_name, u.user_db, s.expires_at
+        FROM sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.token = ? AND s.expires_at > ?
+    """, (token, now)).fetchone()
+    if row is None:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+    conn.close()
+    try:
+        db_path = user_db_path(row["user_db"])
+        init_user_database(db_path)
+    except Exception:
+        return None
+    _REQUEST_CONTEXT.user_id = int(row["id"])
+    _REQUEST_CONTEXT.db_file = db_path
+    return dict(row)
+
+
+def set_session_cookie(handler, token, expires):
+    secure = handler.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    parts = [f"budgetpet_session={token}", "Path=/", "HttpOnly", "SameSite=Lax", f"Max-Age={SESSION_TTL_SECONDS}"]
+    if secure:
+        parts.append("Secure")
+    handler.send_header("Set-Cookie", "; ".join(parts))
+
+
+def clear_session_cookie(handler):
+    handler.send_header("Set-Cookie", "budgetpet_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+
+
+def count_users():
+    conn = get_auth_connection()
+    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    return int(count)
 
 
 def database_is_valid():
@@ -87,117 +350,10 @@ def prepare_database_file():
 
 
 def init_sqlite_db():
-    prepare_database_file()
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS budgets (
-            month_year TEXT PRIMARY KEY,
-            monthly_limit REAL DEFAULT 3000000,
-            monthly_income REAL DEFAULT 5000000
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bills (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            amount INTEGER,
-            paid INTEGER,
-            icon TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS jars (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            percentage INTEGER
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            merchant TEXT,
-            title TEXT,
-            amount INTEGER,
-            time TEXT,
-            category TEXT DEFAULT 'Khác',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS goals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            target REAL NOT NULL DEFAULT 0,
-            current REAL NOT NULL DEFAULT 0,
-            icon TEXT DEFAULT '🎯',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Persistent app customization.
-    defaults = {
-        "pet_name": "Paws",
-        "pet_type": "cat",
-        "logo_image": "",
-        "display_name": "Duy",
-    }
-    for key, value in defaults.items():
-        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
-
-    # Migration for older BudgetPet databases.
-    columns = {
-        row["name"]
-        for row in cursor.execute("PRAGMA table_info(transactions)").fetchall()
-    }
-    if "category" not in columns:
-        cursor.execute(
-            "ALTER TABLE transactions ADD COLUMN category TEXT DEFAULT 'Khác'"
-        )
-
-    cursor.execute("SELECT COUNT(*) AS count FROM bills")
-    if cursor.fetchone()["count"] == 0:
-        default_bills = [
-            ("Tiền Phòng Trọ", 2500000, 0, "home"),
-            ("Điện Nước", 320000, 1, "flash"),
-            ("Spotify Student", 29000, 1, "music"),
-            ("Internet Wifi", 110000, 0, "wifi"),
-        ]
-        cursor.executemany(
-            "INSERT INTO bills (title, amount, paid, icon) VALUES (?, ?, ?, ?)",
-            default_bills,
-        )
-
-    cursor.execute("SELECT COUNT(*) AS count FROM jars")
-    if cursor.fetchone()["count"] == 0:
-        default_jars = [
-            ("Nhu cầu thiết yếu", 55),
-            ("Giáo dục", 10),
-            ("Tiết kiệm", 0),
-            ("Tự do tài chính", 10),
-            ("Hưởng thụ", 10),
-            ("Từ thiện", 5),
-        ]
-        cursor.executemany(
-            "INSERT INTO jars (name, percentage) VALUES (?, ?)",
-            default_jars,
-        )
-
-    conn.commit()
-    conn.close()
+    init_auth_db()
+    # Compatibility helper: initialize the legacy local DB only when explicitly requested.
+    if current_user_db():
+        init_user_database(current_user_db())
 
 
 def get_db_data():
@@ -307,7 +463,7 @@ def get_db_data():
         "unpaid_bill_total": unpaid_bill_total,
         "ramen_index": ramen_index,
         "pet": pet,
-        "display_name": settings.get("display_name") or "Duy",
+        "display_name": settings.get("display_name") or "",
         "bills": bills,
         "jars": jars,
         "transactions": transactions,
@@ -426,18 +582,16 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         text_response(self, text, status, content_type)
 
     def do_GET(self):
+        clear_request_context()
         path = self.path.split("?", 1)[0]
+        user = session_user(self)
 
         if path in ("/", "/index.html"):
-            template_path = TEMPLATES_DIR / "index.html"
-
+            filename = "index.html" if user else "auth.html"
+            template_path = TEMPLATES_DIR / filename
             if not template_path.exists():
-                self._send_text(
-                    "Không tìm thấy templates/index.html",
-                    404,
-                )
+                self._send_text(f"Không tìm thấy templates/{filename}", 404)
                 return
-
             try:
                 body = template_path.read_bytes()
                 self.send_response(200)
@@ -446,7 +600,7 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             except OSError as exc:
-                self._send_text(f"Không thể đọc index.html: {exc}", 500)
+                self._send_text(f"Không thể đọc giao diện: {exc}", 500)
             return
 
         if path in ("/api/health", "/health"):
@@ -454,6 +608,8 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 "status": "ok",
                 "language": "Python 3.13+",
                 "engine": "BudgetPet Pure Python Server",
+                "demo_max_users": MAX_DEMO_USERS,
+                "registered_users": count_users(),
             })
             return
 
@@ -462,21 +618,148 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if path == "/api/me":
+            if not user:
+                self._send_json({"authenticated": False}, 401)
+                return
+            self._send_json({
+                "authenticated": True,
+                "username": user["username"],
+                "display_name": user["display_name"],
+            })
+            return
+
         if path == "/api/data":
+            if not user:
+                self._send_json({"success": False, "error": "Bạn chưa đăng nhập."}, 401)
+                return
             try:
                 self._send_json(get_db_data())
             except Exception as exc:
                 print("Database error:", exc)
-                self._send_json({
-                    "success": False,
-                    "error": f"Lỗi database: {exc}",
-                }, 500)
+                self._send_json({"success": False, "error": f"Lỗi database: {exc}"}, 500)
             return
 
         self._send_json({"error": "Endpoint not found"}, 404)
 
     def do_POST(self):
+        clear_request_context()
         path = self.path.split("?", 1)[0]
+
+        # ----------------------------------------------------
+        # Authentication: register / login / logout
+        # ----------------------------------------------------
+        if path == "/api/register":
+            payload = parse_json_body(self)
+            if not isinstance(payload, dict):
+                self._send_json({"success": False, "error": "Dữ liệu đăng ký không hợp lệ."}, 400)
+                return
+            username = str(payload.get("username", "")).strip()
+            display_name = str(payload.get("display_name", "")).strip()[:40]
+            password = str(payload.get("password", ""))
+            confirm = str(payload.get("confirm_password", ""))
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{3,24}", username):
+                self._send_json({"success": False, "error": "Tên đăng nhập 3-24 ký tự, chỉ gồm chữ, số, ., _ hoặc -."}, 400)
+                return
+            if len(password) < 6:
+                self._send_json({"success": False, "error": "Mật khẩu phải có ít nhất 6 ký tự."}, 400)
+                return
+            if password != confirm:
+                self._send_json({"success": False, "error": "Mật khẩu xác nhận không khớp."}, 400)
+                return
+            if not display_name:
+                display_name = username
+            conn = get_auth_connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                if count >= MAX_DEMO_USERS:
+                    conn.rollback()
+                    self._send_json({"success": False, "error": f"Bản demo giới hạn {MAX_DEMO_USERS} tài khoản."}, 400)
+                    return
+                salt, password_hash = hash_password(password)
+                db_rel = f"database/users/{secrets.token_hex(16)}.db"
+                cur = conn.execute(
+                    "INSERT INTO users(username, display_name, password_hash, password_salt, user_db) VALUES (?, ?, ?, ?, ?)",
+                    (username, display_name, password_hash, salt, db_rel),
+                )
+                user_id = cur.lastrowid
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                self._send_json({"success": False, "error": "Tên đăng nhập đã tồn tại."}, 409)
+                return
+            except Exception as exc:
+                conn.rollback()
+                self._send_json({"success": False, "error": f"Không thể tạo tài khoản: {exc}"}, 500)
+                return
+            finally:
+                conn.close()
+            try:
+                user_db_file = BASE_DIR / db_rel
+                create_user_database(user_db_file)
+                user_conn = get_connection(user_db_file)
+                user_conn.execute(
+                    "INSERT INTO settings(key,value) VALUES('display_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (display_name,)
+                )
+                user_conn.commit()
+                user_conn.close()
+                token, expires = create_session(user_id)
+                self.send_response(200)
+                set_session_cookie(self, token, expires)
+                body = json.dumps({"success": True, "display_name": display_name}, ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:
+                # Remove the user record if its database could not be initialized.
+                conn = get_auth_connection()
+                conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                conn.commit(); conn.close()
+                self._send_json({"success": False, "error": f"Không thể khởi tạo dữ liệu tài khoản: {exc}"}, 500)
+            return
+
+        if path == "/api/login":
+            payload = parse_json_body(self)
+            if not isinstance(payload, dict):
+                self._send_json({"success": False, "error": "Dữ liệu đăng nhập không hợp lệ."}, 400)
+                return
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", ""))
+            conn = get_auth_connection()
+            row = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone()
+            conn.close()
+            if not row or not verify_password(password, row["password_salt"], row["password_hash"]):
+                self._send_json({"success": False, "error": "Sai tên đăng nhập hoặc mật khẩu."}, 401)
+                return
+            token, expires = create_session(row["id"])
+            self.send_response(200)
+            set_session_cookie(self, token, expires)
+            body = json.dumps({"success": True, "display_name": row["display_name"]}, ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/api/logout":
+            token = parse_cookie_token(self)
+            delete_session(token)
+            self.send_response(200)
+            clear_session_cookie(self)
+            body = b'{"success":true}'
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        user = session_user(self)
+        if not user:
+            self._send_json({"success": False, "error": "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại."}, 401)
+            return
 
         # ----------------------------------------------------
         # Scan bill with Gemini
@@ -802,9 +1085,18 @@ HƯỚNG DẪN:
             if not name:
                 self._send_json({"success": False, "error": "Tên người dùng không được để trống"}, 400)
                 return
+            # Keep the account profile and the per-user settings in sync so the
+            # greeting always uses the name chosen at registration/profile edit.
+            user = session_user(self)
+            if not user:
+                self._send_json({"success": False, "error": "Phiên đăng nhập đã hết hạn."}, 401)
+                return
             conn = get_connection(); cursor = conn.cursor()
             cursor.execute("INSERT INTO settings(key,value) VALUES('display_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (name,))
             conn.commit(); conn.close()
+            auth = get_auth_connection()
+            auth.execute("UPDATE users SET display_name=? WHERE id=?", (name, user["id"]))
+            auth.commit(); auth.close()
             self._send_json({"success": True, "display_name": name}); return
 
         if path == "/api/remove-logo":
@@ -985,7 +1277,8 @@ def run_server():
             print(f"   IP LAN phát hiện: {ip}")
     except Exception:
         pass
-    print(f"💾 Database: {DB_FILE}")
+    print(f"💾 Auth database: {AUTH_DB_FILE}")
+    print(f"👥 Demo limit: {MAX_DEMO_USERS} tài khoản; mỗi tài khoản có SQLite riêng trong {USERS_DIR}")
     print("⛔ Nhấn Ctrl+C để dừng server")
     print("=" * 60, flush=True)
 

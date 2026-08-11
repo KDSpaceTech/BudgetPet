@@ -1,2 +1,2 @@
 # BudgetPet uses only Python standard-library modules.
-# No pip packages are required for the current build.
+# No third-party packages are required.

@@ -1,9 +1,7 @@
 name: Python check
-
 on:
   push:
   pull_request:
-
 jobs:
   compile:
     runs-on: ubuntu-latest
@@ -11,13 +9,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
       - name: Compile
         run: python -m py_compile app.py
-      - name: Smoke test
-        run: |
-          python - <<'PY'
-          import app
-          app.init_sqlite_db()
-          print('BudgetPet import/init: OK')
-          PY

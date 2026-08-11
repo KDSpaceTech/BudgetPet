@@ -1,6 +1,7 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 WORKDIR /app
-COPY . .
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+COPY . .
 EXPOSE 3000
 CMD ["python", "app.py"]

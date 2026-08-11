@@ -1,74 +1,72 @@
-# BudgetPet
+# BudgetPet — Multi-User Demo (tối đa 30 tài khoản)
 
-Mobile-first personal finance web app built with Python, SQLite and a Gemini Vision OCR API.
+BudgetPet là ứng dụng quản lý chi tiêu thuần Python với AI OCR hóa đơn và gamification nuôi Pet.
 
-## Features
+## Điểm mới của bản Multi-User
 
-- Mobile-friendly 5-tab UI
-- Gemini OCR for receipt/bill scanning
-- Camera capture and gallery upload
-- Recurring bills: add, edit, delete, mark paid
-- Paid recurring bills reduce the available monthly budget
-- 6 Jars budgeting
-- Savings goals
-- Pet selection and naming
-- BudgetPet avatar upload
-- User display-name editing
-- Vietnamese in-app usage guide
+- Giữ nguyên giao diện BudgetPet mobile hiện tại.
+- Đăng ký tài khoản.
+- Đăng nhập / đăng xuất.
+- Mỗi tài khoản có **SQLite database riêng** trong `database/users/`.
+- Dữ liệu của User A không dùng chung với User B.
+- Tách riêng Pet, tên người dùng, avatar, giao dịch, 6 Hũ, mục tiêu và hóa đơn định kỳ.
+- Giới hạn demo: **30 tài khoản**.
+- Mật khẩu được hash bằng PBKDF2-HMAC-SHA256, không lưu plain text.
+- Session dùng cookie HttpOnly.
+- Gemini API key chỉ đọc từ biến môi trường `GEMINI_API_KEY`.
 
-## Requirements
-
-- Python 3.10+
-- A Gemini API key for OCR
-- No third-party Python packages are required by the current source
-
-## Local run
-
-Windows:
+## Chạy local
 
 ```powershell
 python app.py
 ```
 
-Then open `http://localhost:3000`.
+Mở:
 
-For a phone on the same LAN, open the computer's LAN IP and port 3000, e.g. `http://192.168.1.10:3000`.
+```text
+http://localhost:3000
+```
 
-## Environment variables
+Điện thoại cùng Wi-Fi có thể dùng IP LAN của máy tính:
 
-Copy `.env.example` to `.env` for local reference, but note that this app does not load `.env` automatically. Set the variables in your shell or hosting provider.
+```text
+http://IP-MAY-TINH:3000
+```
+
+## Gemini API key
+
+Không đặt key thật trong source code. Thiết lập biến môi trường:
 
 PowerShell:
 
 ```powershell
-$env:GEMINI_API_KEY="YOUR_KEY"
+$env:GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
 python app.py
 ```
 
-Linux/macOS:
+Khi deploy Render/Docker, đặt `GEMINI_API_KEY` trong Environment Variables/Secrets.
 
-```bash
-export GEMINI_API_KEY="YOUR_KEY"
-python app.py
+## GitHub
+
+Không commit:
+
+- `.env`
+- `database/*.db`
+- `database/users/`
+
+Các file này đã được chặn bởi `.gitignore`.
+
+## Demo multi-user
+
+Tài khoản được lưu trong `database/auth.db`. Mỗi user có một database riêng, ví dụ:
+
+```text
+database/
+├── auth.db
+└── users/
+    ├── <user-db-1>.db
+    ├── <user-db-2>.db
+    └── ...
 ```
 
-Optional:
-
-- `PORT` — HTTP port, default `3000`
-- `DB_FILE` — SQLite file path; use a persistent disk/volume when deploying
-
-## GitHub security
-
-**Never commit a real Gemini API key.** Keep it in the hosting provider's secret/environment-variable settings. The repository intentionally contains no database file and no API key.
-
-Because a real API key was previously pasted into chat/source during development, rotate/revoke that key before publishing this repository.
-
-## Deployment
-
-This repository includes:
-
-- `Procfile` for Procfile-based Python hosts
-- `Dockerfile` for container deployment
-- GitHub Actions workflow that compiles `app.py` and performs a SQLite smoke test
-
-For production, configure persistent storage for `DB_FILE`. The current app is designed as a small/personal app; for multi-user production workloads, move from SQLite to PostgreSQL.
+Do đó thay đổi ở tài khoản này không làm thay đổi dữ liệu của tài khoản khác.

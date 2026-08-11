@@ -1,6 +1,9 @@
 .git
-.gitignore
-.env
-*.db
+.github
 __pycache__
 *.pyc
+.env
+*.db
+*.sqlite
+*.sqlite3
+database/users

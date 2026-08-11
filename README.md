@@ -70,3 +70,12 @@ database/
 ```
 
 Do đó thay đổi ở tài khoản này không làm thay đổi dữ liệu của tài khoản khác.
+
+## Money-flow automation (v2)
+
+- Monthly income is routed into six jars by percentage. The six percentages must total exactly 100%; rounding leftovers are assigned to **Nhu cầu thiết yếu**.
+- OCR flow is **read → classify → route to jar → record expense**. Hobby/personal-shopping keywords such as keycap/keyboard are routed to **Hưởng thụ**.
+- Jar balances are allowed to go negative. A negative jar is marked as a red alert and the Pet displays a warning message.
+- Recurring bills support a due day and target jar. A background worker checks bills automatically and creates at most one payment transaction per bill/month.
+- Goal deposits are transfers out of **Tiết kiệm**. Deposits are rejected when the savings jar does not have enough balance.
+- Gemini OCR uses retry/backoff for transient 429/5xx errors and supports a fallback model. Configure `GEMINI_MODEL` and `GEMINI_FALLBACK_MODELS` through environment variables.

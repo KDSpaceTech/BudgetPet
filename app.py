@@ -12,6 +12,7 @@ import threading
 import secrets
 import hashlib
 import hmac
+import calendar
 from http.cookies import SimpleCookie
 from pathlib import Path
 from datetime import datetime
@@ -27,6 +28,8 @@ PORT = int(os.environ.get("PORT", "3000"))
 # Gemini key is intentionally read only from the environment. Never commit the
 # real key to GitHub.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip() or "gemini-flash-latest"
+GEMINI_FALLBACK_MODELS = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite").split(",") if m.strip()]
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_DIR = BASE_DIR / "database"
@@ -209,6 +212,50 @@ def init_user_database(path):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Money-flow tables: monthly income allocation, per-transaction jar routing, and idempotent bill payments.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS income_allocations (
+            month_year TEXT PRIMARY KEY,
+            allocated_income REAL NOT NULL DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jar_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            month_year TEXT NOT NULL,
+            jar_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            movement_type TEXT NOT NULL,
+            reference_type TEXT,
+            reference_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bill_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id INTEGER NOT NULL,
+            month_year TEXT NOT NULL,
+            transaction_id INTEGER,
+            UNIQUE(bill_id, month_year)
+        )
+    """)
+    # Safe schema migrations for databases created by older BudgetPet versions.
+    existing_bill_cols={r['name'] for r in cursor.execute("PRAGMA table_info(bills)").fetchall()}
+    for col, ddl in {
+        'due_day': "ALTER TABLE bills ADD COLUMN due_day INTEGER DEFAULT 1",
+        'target_jar': "ALTER TABLE bills ADD COLUMN target_jar TEXT DEFAULT 'Nhu cầu thiết yếu'",
+    }.items():
+        if col not in existing_bill_cols:
+            cursor.execute(ddl)
+    existing_tx_cols={r['name'] for r in cursor.execute("PRAGMA table_info(transactions)").fetchall()}
+    for col, ddl in {
+        'jar_name': "ALTER TABLE transactions ADD COLUMN jar_name TEXT DEFAULT 'Hưởng thụ'",
+        'source_type': "ALTER TABLE transactions ADD COLUMN source_type TEXT DEFAULT 'manual'",
+        'source_id': "ALTER TABLE transactions ADD COLUMN source_id INTEGER",
+    }.items():
+        if col not in existing_tx_cols:
+            cursor.execute(ddl)
     defaults = {
         "pet_name": "Paws",
         "pet_type": "cat",
@@ -221,14 +268,17 @@ def init_user_database(path):
     cursor.execute("SELECT COUNT(*) AS count FROM bills")
     if cursor.fetchone()["count"] == 0:
         cursor.executemany(
-            "INSERT INTO bills (title, amount, paid, icon) VALUES (?, ?, ?, ?)",
+            "INSERT INTO bills (title, amount, paid, icon, due_day, target_jar) VALUES (?, ?, ?, ?, ?, ?)",
             [
-                ("Tiền Phòng Trọ", 2500000, 0, "home"),
-                ("Điện Nước", 320000, 1, "flash"),
-                ("Spotify Student", 29000, 1, "music"),
-                ("Internet Wifi", 110000, 0, "wifi"),
+                ("Tiền Phòng Trọ", 2500000, 0, "home", 15, "Nhu cầu thiết yếu"),
+                ("Điện Nước", 320000, 1, "flash", 15, "Nhu cầu thiết yếu"),
+                ("Spotify Student", 29000, 1, "music", 15, "Hưởng thụ"),
+                ("Internet Wifi", 110000, 0, "wifi", 15, "Nhu cầu thiết yếu"),
             ],
         )
+    else:
+        cursor.execute("UPDATE bills SET due_day=15 WHERE due_day IS NULL OR due_day<=0")
+        cursor.execute("UPDATE bills SET target_jar='Hưởng thụ' WHERE lower(title) LIKE '%spotify%' AND (target_jar IS NULL OR target_jar='Nhu cầu thiết yếu')")
     cursor.execute("SELECT COUNT(*) AS count FROM jars")
     if cursor.fetchone()["count"] == 0:
         cursor.executemany(
@@ -236,12 +286,17 @@ def init_user_database(path):
             [
                 ("Nhu cầu thiết yếu", 55),
                 ("Giáo dục", 10),
-                ("Tiết kiệm", 0),
+                ("Tiết kiệm", 10),
                 ("Tự do tài chính", 10),
                 ("Hưởng thụ", 10),
                 ("Từ thiện", 5),
             ],
         )
+    # Ensure legacy/default jar percentages always total exactly 100%.
+    total_pct=cursor.execute("SELECT COALESCE(SUM(percentage),0) FROM jars").fetchone()[0]
+    if int(total_pct)!=100:
+        diff=100-int(total_pct)
+        cursor.execute("UPDATE jars SET percentage=MAX(0,percentage+?) WHERE name='Nhu cầu thiết yếu'",(diff,))
     conn.commit()
     conn.close()
 
@@ -356,11 +411,162 @@ def init_sqlite_db():
         init_user_database(current_user_db())
 
 
+JAR_NAMES = [
+    "Nhu cầu thiết yếu", "Giáo dục", "Tiết kiệm", "Tự do tài chính", "Hưởng thụ", "Từ thiện"
+]
+CATEGORY_TO_JAR = {
+    "Ăn uống": "Nhu cầu thiết yếu",
+    "Di chuyển": "Nhu cầu thiết yếu",
+    "Hóa đơn": "Nhu cầu thiết yếu",
+    "Học tập": "Giáo dục",
+    "Mua sắm": "Hưởng thụ",
+    "Vui chơi": "Hưởng thụ",
+    "Khác": "Hưởng thụ",
+}
+
+
+def current_month():
+    return datetime.now().strftime("%m/%Y")
+
+
+def get_jar_percentages(conn):
+    rows = conn.execute("SELECT name, percentage FROM jars ORDER BY id ASC").fetchall()
+    return {r["name"]: int(r["percentage"] or 0) for r in rows}
+
+
+def allocate_income_delta(conn, month_year, delta):
+    """Allocate a net income delta by percentages. Integer rounding remainder goes to Essentials."""
+    if delta == 0:
+        return
+    pcts = get_jar_percentages(conn)
+    total = sum(pcts.get(n, 0) for n in JAR_NAMES)
+    if total != 100:
+        raise ValueError("Tổng tỷ lệ 6 Hũ phải bằng 100% trước khi phân bổ thu nhập.")
+    allocations = {}
+    remaining = int(delta)
+    for name in JAR_NAMES:
+        if name == "Nhu cầu thiết yếu":
+            continue
+        amount = int(delta * pcts.get(name, 0) / 100)
+        allocations[name] = amount
+        remaining -= amount
+    allocations["Nhu cầu thiết yếu"] = remaining
+    for name, amount in allocations.items():
+        conn.execute(
+            "INSERT INTO jar_movements(month_year,jar_name,amount,movement_type,reference_type) VALUES(?,?,?,?,?)",
+            (month_year, name, amount, "income", "monthly_income"),
+        )
+
+
+def jar_balance_map(conn, month_year):
+    rows = conn.execute("""
+        SELECT jar_name, COALESCE(SUM(amount),0) AS balance
+        FROM jar_movements WHERE month_year=? GROUP BY jar_name
+    """, (month_year,)).fetchall()
+    out = {name: 0 for name in JAR_NAMES}
+    for r in rows:
+        out[r["jar_name"]] = int(round(r["balance"] or 0))
+    return out
+
+
+def ensure_month_income_allocation(conn, month_year, monthly_income):
+    row = conn.execute("SELECT allocated_income FROM income_allocations WHERE month_year=?", (month_year,)).fetchone()
+    allocated = float(row["allocated_income"]) if row else 0.0
+    delta = float(monthly_income) - allocated
+    if abs(delta) > 0.0001:
+        allocate_income_delta(conn, month_year, int(round(delta)))
+        conn.execute(
+            "INSERT INTO income_allocations(month_year,allocated_income) VALUES(?,?) ON CONFLICT(month_year) DO UPDATE SET allocated_income=excluded.allocated_income",
+            (month_year, float(monthly_income)),
+        )
+
+
+def add_jar_movement(conn, jar_name, amount, movement_type, reference_type=None, reference_id=None, month_year=None):
+    if jar_name not in JAR_NAMES:
+        jar_name = "Hưởng thụ"
+    conn.execute(
+        "INSERT INTO jar_movements(month_year,jar_name,amount,movement_type,reference_type,reference_id) VALUES(?,?,?,?,?,?)",
+        (month_year or current_month(), jar_name, amount, movement_type, reference_type, reference_id),
+    )
+
+
+def classify_to_jar(category, note="", vendor=""):
+    text=(f"{category} {note} {vendor}").lower()
+    # Personal shopping / hobby cues go to Enjoyment even if the OCR category is generic.
+    hobby_terms=("keycap","bàn phím","keyboard","figure","mô hình","game","steam","phụ kiện","đồ chơi","tai nghe","headphone","mouse","chuột")
+    if any(t in text for t in hobby_terms):
+        return "Hưởng thụ"
+    return CATEGORY_TO_JAR.get(category, "Hưởng thụ")
+
+
+def process_bill_payment(conn, bill_id, month_year=None, automatic=False):
+    month_year = month_year or current_month()
+    bill = conn.execute("SELECT * FROM bills WHERE id=?", (bill_id,)).fetchone()
+    if not bill:
+        raise ValueError("Không tìm thấy hóa đơn.")
+    existing = conn.execute("SELECT id FROM bill_payments WHERE bill_id=? AND month_year=?", (bill_id, month_year)).fetchone()
+    if existing:
+        return False
+    jar = bill["target_jar"] or "Nhu cầu thiết yếu"
+    amount = int(bill["amount"] or 0)
+    title = f"Hóa đơn định kỳ: {bill['title']}"
+    conn.execute("INSERT INTO transactions(merchant,title,amount,time,category,jar_name,source_type,source_id) VALUES(?,?,?,?,?,?,?,?)",
+                 (bill["title"], title, amount, datetime.now().strftime("%H:%M"), "Hóa đơn", jar, "recurring_bill", bill_id))
+    txid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    add_jar_movement(conn, jar, -amount, "expense", "bill", bill_id, month_year)
+    conn.execute("INSERT INTO bill_payments(bill_id,month_year,transaction_id) VALUES(?,?,?)", (bill_id,month_year,txid))
+    conn.execute("UPDATE bills SET paid=1 WHERE id=?", (bill_id,))
+    return True
+
+
+def process_due_bills_for_db(db_path, force_due=False):
+    conn=get_connection(db_path)
+    month=current_month(); today=datetime.now().day
+    # A checked bill belongs to a specific month. At the start of a new month,
+    # an old checked state is reset unless a payment record already exists for this month.
+    conn.execute("UPDATE bills SET paid=0 WHERE paid=1 AND id NOT IN (SELECT bill_id FROM bill_payments WHERE month_year=?)", (month,))
+    rows=conn.execute("SELECT id,due_day FROM bills").fetchall()
+    changed=False
+    for r in rows:
+        due=min(int(r["due_day"] or 1), calendar.monthrange(datetime.now().year, datetime.now().month)[1])
+        if force_due or today >= due:
+            try:
+                changed = process_bill_payment(conn,r["id"],month,automatic=True) or changed
+            except Exception as exc:
+                print("Recurring bill error:", exc)
+    if changed: conn.commit()
+    else: conn.rollback()
+    conn.close()
+    return changed
+
+
+def process_all_due_bills():
+    try:
+        conn=get_auth_connection()
+        rows=conn.execute("SELECT user_db FROM users").fetchall(); conn.close()
+        for r in rows:
+            try:
+                process_due_bills_for_db(user_db_path(r["user_db"]))
+            except Exception as exc:
+                print("Scheduled bill error:", exc)
+    except Exception as exc:
+        print("Scheduler error:", exc)
+
+
+def recurring_bill_worker():
+    while True:
+        try:
+            process_all_due_bills()
+        except Exception as exc:
+            print("Bill worker error:", exc)
+        threading.Event().wait(60)
+
+
 def get_db_data():
     conn = get_connection()
     cursor = conn.cursor()
 
-    current_my = datetime.now().strftime("%m/%Y")
+    current_my = current_month()
     cursor.execute(
         "SELECT monthly_limit, monthly_income FROM budgets WHERE month_year = ?",
         (current_my,),
@@ -376,8 +582,16 @@ def get_db_data():
         monthly_limit = float(srow["value"]) if srow else 3000000
         monthly_income = 5000000
 
+    # The income router runs before any expense is shown.
+    try:
+        ensure_month_income_allocation(conn, current_my, monthly_income)
+        conn.commit()
+    except ValueError:
+        # Keep the page readable; the settings endpoint blocks invalid percentages.
+        conn.rollback()
+
     cursor.execute("""
-        SELECT id, merchant, title, amount, time, category
+        SELECT id, merchant, title, amount, time, category, jar_name
         FROM transactions
         ORDER BY id DESC
     """)
@@ -399,6 +613,7 @@ def get_db_data():
             "amount": amt,
             "time": r["time"],
             "category": cat,
+            "jar_name": r["jar_name"] or classify_to_jar(cat, r["title"] or "", r["merchant"] or ""),
         })
 
         if cat not in category_summary_map:
@@ -413,14 +628,18 @@ def get_db_data():
 
     category_summary = list(category_summary_map.values())
 
-    cursor.execute("SELECT id, title, amount, paid, icon FROM bills ORDER BY id ASC")
+    cursor.execute("SELECT id, title, amount, paid, icon, due_day, target_jar FROM bills ORDER BY id ASC")
     bills = [dict(r) for r in cursor.fetchall()]
     paid_bill_total = sum(int(b["amount"] or 0) for b in bills if int(b["paid"] or 0) == 1)
     unpaid_bill_total = sum(int(b["amount"] or 0) for b in bills if int(b["paid"] or 0) == 0)
-    total_spent += paid_bill_total
+    # Recurring bill payments are also stored as transactions, so do not double-count them here.
 
+    jar_balances = jar_balance_map(conn, current_my)
     cursor.execute("SELECT id, name, percentage FROM jars ORDER BY id ASC")
-    jars = [dict(r) for r in cursor.fetchall()]
+    jars = []
+    for r in cursor.fetchall():
+        d=dict(r); d["balance"]=jar_balances.get(d["name"],0); d["allocated_amount"]=int(round(monthly_income*int(d["percentage"] or 0)/100)); d["negative"]=d["balance"]<0; jars.append(d)
+    negative_jars=[j["name"] for j in jars if j["negative"]]
 
     cursor.execute("""
         SELECT id, name, target, current, icon
@@ -441,17 +660,26 @@ def get_db_data():
 
     pet_type = settings.get("pet_type") or "cat"
     pet_name = settings.get("pet_name") or "Paws"
-    if ratio < 0.5:
+    if negative_jars:
+        worst=min((j for j in jars if j["negative"]), key=lambda x:x["balance"])
+        abs_v=abs(int(worst["balance"]))
+        quote=f'"Chủ nhân ơi, {worst["name"]} đang âm {abs_v:,}đ rồi! Tháng sau phải bớt chi tiêu để đắp vào nha!"'
+        pet_alert=True
+    elif ratio < 0.5:
         quote = f'"Chủ nhân tiết kiệm giỏi quá! {pet_name} cảm thấy rất vui!"'
+        pet_alert=False
     elif ratio <= 0.8:
         quote = '"Vẫn trong tầm kiểm soát! Giữ vững phong độ nha!"'
+        pet_alert=False
     else:
         quote = '"Cứu! Sắp phải ăn mì tôm cả tháng rồi sếp ơi!!"'
+        pet_alert=False
     pet = {
         "type": pet_type,
         "name": pet_name,
         "quote": quote,
         "logo_image": settings.get("logo_image") or "",
+        "alert": pet_alert,
     }
 
     return {
@@ -469,6 +697,7 @@ def get_db_data():
         "transactions": transactions,
         "category_summary": category_summary,
         "goals": goals,
+        "negative_jars": negative_jars,
     }
 
 
@@ -571,6 +800,39 @@ def clean_json_text(text):
         text = re.sub(r"\s*```$", "", text)
 
     return text.strip()
+
+
+def gemini_generate_json(req_data, api_key):
+    """Call Gemini with bounded retries and model fallback for transient 503/429 errors."""
+    models=[]
+    for m in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+        if m and m not in models:
+            models.append(m)
+    last_detail="Gemini không phản hồi."
+    for model in models:
+        for attempt in range(3):
+            url=("https://generativelanguage.googleapis.com/v1beta/"
+                 f"models/{model}:generateContent?key={api_key}")
+            req=urllib.request.Request(url,data=json.dumps(req_data).encode("utf-8"),
+                                       headers={"Content-Type":"application/json"},method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    return json.loads(response.read()), model
+            except urllib.error.HTTPError as exc:
+                try: detail=exc.read().decode("utf-8",errors="replace")
+                except Exception: detail=str(exc)
+                last_detail=f"HTTP {exc.code}: {detail}"
+                if exc.code not in (429,500,502,503,504):
+                    raise
+                if attempt < 2:
+                    import time
+                    time.sleep(2 ** attempt)
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_detail=str(exc)
+                if attempt < 2:
+                    import time
+                    time.sleep(2 ** attempt)
+    raise RuntimeError(f"Gemini tạm thời không khả dụng sau khi thử lại và fallback model. {last_detail}")
 
 
 class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -831,22 +1093,7 @@ HƯỚNG DẪN:
                     },
                 }
 
-                url = (
-                    "https://generativelanguage.googleapis.com/v1beta/"
-                    "models/gemini-2.5-flash:generateContent"
-                    f"?key={api_key}"
-                )
-
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(req_data).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-
-                with urllib.request.urlopen(req, timeout=None) as response:
-                    res_body = response.read()
-                    gen_data = json.loads(res_body)
+                gen_data, used_model = gemini_generate_json(req_data, api_key)
 
                 ans_text = clean_json_text(extract_gemini_text(gen_data))
                 result = json.loads(ans_text)
@@ -888,36 +1135,27 @@ HƯỚNG DẪN:
                     amount_val = 0
 
                 current_time = datetime.now().strftime("%H:%M")
+                jar_name = classify_to_jar(final_category, result.get("note", ""), result.get("vendor", ""))
 
                 conn = get_connection()
                 cursor = conn.cursor()
-
+                # Classification is completed first; only then is the expense routed to its jar.
                 cursor.execute(
                     """
                     INSERT INTO transactions
-                    (merchant, title, amount, time, category)
-                    VALUES (?, ?, ?, ?, ?)
+                    (merchant, title, amount, time, category, jar_name, source_type)
+                    VALUES (?, ?, ?, ?, ?, ?, 'ocr')
                     """,
-                    (
-                        result.get("vendor", "Giao dịch mới"),
-                        result.get("note", "Chi tiêu"),
-                        amount_val,
-                        current_time,
-                        final_category,
-                    ),
+                    (result.get("vendor", "Giao dịch mới"), result.get("note", "Chi tiêu"), amount_val, current_time, final_category, jar_name),
                 )
-
                 tx_id = cursor.lastrowid
-                conn.commit()
-                conn.close()
+                add_jar_movement(cursor.connection, jar_name, -amount_val, "expense", "transaction", tx_id, current_month())
+                conn.commit(); conn.close()
 
                 tx = {
-                    "id": tx_id,
-                    "merchant": result.get("vendor", "Giao dịch mới"),
-                    "title": result.get("note", "Chi tiêu"),
-                    "amount": amount_val,
-                    "time": current_time,
-                    "category": final_category,
+                    "id": tx_id, "merchant": result.get("vendor", "Giao dịch mới"),
+                    "title": result.get("note", "Chi tiêu"), "amount": amount_val,
+                    "time": current_time, "category": final_category, "jar_name": jar_name,
                 }
 
                 full_data = get_db_data()
@@ -926,6 +1164,7 @@ HƯỚNG DẪN:
                     "success": True,
                     "transaction": tx,
                     "pet_status": full_data["pet"],
+                    "model": used_model,
                 })
                 return
 
@@ -982,54 +1221,44 @@ HƯỚNG DẪN:
         if path == "/api/set-budget":
             monthly_limit = payload.get("monthly_limit")
             monthly_income = payload.get("monthly_income")
-
             if monthly_limit is None or monthly_income is None:
-                self._send_json({"error": "Missing params"}, 400)
-                return
-
-            current_my = datetime.now().strftime("%m/%Y")
-
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO budgets
-                    (month_year, monthly_limit, monthly_income)
-                VALUES (?, ?, ?)
-                ON CONFLICT(month_year) DO UPDATE SET
-                    monthly_limit = excluded.monthly_limit,
-                    monthly_income = excluded.monthly_income
-                """,
-                (current_my, float(monthly_limit), float(monthly_income)),
-            )
-            conn.commit()
-            conn.close()
-
-            self._send_json({"success": True})
-            return
+                self._send_json({"error": "Thiếu thu nhập hoặc hạn mức."}, 400); return
+            try:
+                monthly_limit=float(monthly_limit); monthly_income=float(monthly_income)
+            except (TypeError,ValueError):
+                self._send_json({"error":"Số tiền không hợp lệ."},400); return
+            if monthly_limit<0 or monthly_income<0 or (monthly_income>0 and monthly_limit>monthly_income):
+                self._send_json({"error":"Hạn mức phải nằm trong thu nhập và không được âm."},400); return
+            conn=get_connection(); current_my=current_month()
+            if sum(get_jar_percentages(conn).values())!=100:
+                conn.close(); self._send_json({"error":"Tổng tỷ lệ 6 Hũ phải đúng 100% trước khi nhập thu nhập."},400); return
+            conn.execute("INSERT INTO budgets(month_year,monthly_limit,monthly_income) VALUES(?,?,?) ON CONFLICT(month_year) DO UPDATE SET monthly_limit=excluded.monthly_limit, monthly_income=excluded.monthly_income",(current_my,monthly_limit,monthly_income))
+            ensure_month_income_allocation(conn,current_my,monthly_income)
+            conn.commit(); conn.close(); self._send_json({"success":True}); return
 
         if path == "/api/toggle-bill":
-            bill_id = payload.get("id")
-
-            if not bill_id:
-                self._send_json({"error": "Missing bill id"}, 400)
-                return
-
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE bills SET paid = CASE WHEN paid = 1 THEN 0 ELSE 1 END WHERE id = ?",
-                (bill_id,),
-            )
-            conn.commit()
-            conn.close()
-
-            self._send_json({"success": True})
-            return
+            bill_id=payload.get("id")
+            if not bill_id: self._send_json({"error":"Missing bill id"},400); return
+            conn=get_connection(); bill=conn.execute("SELECT * FROM bills WHERE id=?",(bill_id,)).fetchone()
+            if not bill: conn.close(); self._send_json({"error":"Không tìm thấy hóa đơn"},404); return
+            month=current_month(); paid=bool(bill["paid"])
+            if paid:
+                payment=conn.execute("SELECT transaction_id FROM bill_payments WHERE bill_id=? AND month_year=?",(bill_id,month)).fetchone()
+                if payment:
+                    conn.execute("DELETE FROM jar_movements WHERE reference_type='bill' AND reference_id=? AND month_year=?",(bill_id,month))
+                    conn.execute("DELETE FROM transactions WHERE id=?",(payment["transaction_id"],))
+                    conn.execute("DELETE FROM bill_payments WHERE bill_id=? AND month_year=?",(bill_id,month))
+                conn.execute("UPDATE bills SET paid=0 WHERE id=?",(bill_id,))
+            else:
+                process_bill_payment(conn,bill_id,month)
+            conn.commit(); conn.close(); self._send_json({"success":True}); return
 
         if path == "/api/add-bill":
             title = str(payload.get("title", "")).strip()
             icon = str(payload.get("icon", "home")).strip() or "home"
+            due_day = max(1,min(31,int(payload.get("due_day",15))))
+            target_jar = str(payload.get("target_jar", "Nhu cầu thiết yếu")).strip() or "Nhu cầu thiết yếu"
+            if target_jar not in JAR_NAMES: target_jar="Nhu cầu thiết yếu"
             try:
                 amount = to_amount(payload.get("amount"))
             except ValueError as exc:
@@ -1039,7 +1268,7 @@ HƯỚNG DẪN:
                 self._send_json({"success": False, "error": "Tên hóa đơn và số tiền là bắt buộc"}, 400)
                 return
             conn = get_connection(); cursor = conn.cursor()
-            cursor.execute("INSERT INTO bills (title, amount, paid, icon) VALUES (?, ?, 0, ?)", (title, amount, icon))
+            cursor.execute("INSERT INTO bills (title, amount, paid, icon, due_day, target_jar) VALUES (?, ?, 0, ?, ?, ?)", (title, amount, icon, due_day, target_jar))
             bill_id = cursor.lastrowid
             conn.commit(); conn.close()
             self._send_json({"success": True, "id": bill_id}); return
@@ -1048,6 +1277,9 @@ HƯỚNG DẪN:
             bill_id = payload.get("id")
             title = str(payload.get("title", "")).strip()
             icon = str(payload.get("icon", "home")).strip() or "home"
+            due_day = max(1,min(31,int(payload.get("due_day",15))))
+            target_jar = str(payload.get("target_jar", "Nhu cầu thiết yếu")).strip() or "Nhu cầu thiết yếu"
+            if target_jar not in JAR_NAMES: target_jar="Nhu cầu thiết yếu"
             try:
                 amount = to_amount(payload.get("amount"))
             except ValueError as exc:
@@ -1055,7 +1287,7 @@ HƯỚNG DẪN:
             if not bill_id or not title or amount <= 0:
                 self._send_json({"success": False, "error": "Thông tin hóa đơn không hợp lệ"}, 400); return
             conn = get_connection(); cursor = conn.cursor()
-            cursor.execute("UPDATE bills SET title=?, amount=?, icon=? WHERE id=?", (title, amount, icon, bill_id))
+            cursor.execute("UPDATE bills SET title=?, amount=?, icon=?, due_day=?, target_jar=? WHERE id=?", (title, amount, icon, due_day, target_jar, bill_id))
             conn.commit(); conn.close()
             self._send_json({"success": True}); return
 
@@ -1106,36 +1338,33 @@ HƯỚNG DẪN:
             self._send_json({"success": True}); return
 
         if path in ("/api/update-jar", "/api/update-jars"):
-            name = payload.get("name")
-            percentage = payload.get("percentage")
-
-            if not name or percentage is None:
-                self._send_json({
-                    "error": "Invalid jar parameters"
-                }, 400)
-                return
-
-            try:
-                percentage = int(percentage)
-            except (TypeError, ValueError):
-                self._send_json({
-                    "error": "Percentage must be an integer"
-                }, 400)
-                return
-
-            percentage = max(0, min(100, percentage))
-
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE jars SET percentage = ? WHERE name = ?",
-                (percentage, name),
-            )
-            conn.commit()
-            conn.close()
-
-            self._send_json({"success": True})
-            return
+            items=payload.get("jars")
+            if isinstance(items,list):
+                requested={}
+                try:
+                    for item in items:
+                        n=str(item.get("name","")); v=max(0,min(100,int(item.get("percentage"))))
+                        if n not in JAR_NAMES: raise ValueError("Hũ không hợp lệ")
+                        requested[n]=v
+                except (TypeError,ValueError) as exc:
+                    self._send_json({"error":str(exc)},400); return
+                if set(requested)!=set(JAR_NAMES): self._send_json({"error":"Phải gửi đủ 6 Hũ."},400); return
+                total=sum(requested.values())
+                if total>100: self._send_json({"error":f"Tổng 6 Hũ là {total}%, vượt 100%."},400); return
+                if total<100: self._send_json({"error":f"Tổng 6 Hũ mới {total}%. Cần đủ 100%."},400); return
+                conn=get_connection()
+                for n,v in requested.items(): conn.execute("UPDATE jars SET percentage=? WHERE name=?",(v,n))
+                conn.commit(); conn.close(); self._send_json({"success":True,"total":100}); return
+            name=payload.get("name"); percentage=payload.get("percentage")
+            if name not in JAR_NAMES or percentage is None: self._send_json({"error":"Hũ không hợp lệ."},400); return
+            try: percentage=max(0,min(100,int(percentage)))
+            except (TypeError,ValueError): self._send_json({"error":"Phần trăm không hợp lệ."},400); return
+            conn=get_connection(); current=get_jar_percentages(conn); total=sum(v for k,v in current.items() if k!=name)+percentage
+            if total>100:
+                conn.close(); self._send_json({"error":f"Tổng 6 Hũ sẽ là {total}%. Không được vượt 100%."},400); return
+            if total!=100:
+                conn.close(); self._send_json({"error":f"Tổng 6 Hũ phải đúng 100% (hiện {total}%). Hãy phân bổ phần còn lại trước khi lưu."},400); return
+            conn.execute("UPDATE jars SET percentage=? WHERE name=?",(percentage,name)); conn.commit(); conn.close(); self._send_json({"success":True}); return
 
         if path == "/api/delete-tx":
             tx_id = payload.get("id")
@@ -1146,10 +1375,13 @@ HƯỚNG DẪN:
 
             conn = get_connection()
             cursor = conn.cursor()
-            cursor.execute(
-                "DELETE FROM transactions WHERE id = ?",
-                (tx_id,),
-            )
+            tx=cursor.execute("SELECT * FROM transactions WHERE id=?",(tx_id,)).fetchone()
+            if not tx: conn.close(); self._send_json({"error":"Không tìm thấy giao dịch"},404); return
+            if tx["source_type"]=="recurring_bill":
+                conn.execute("DELETE FROM bill_payments WHERE transaction_id=?",(tx_id,))
+                conn.execute("DELETE FROM bills WHERE id=?",(tx["source_id"],)) if False else None
+            conn.execute("DELETE FROM jar_movements WHERE reference_type='transaction' AND reference_id=?",(tx_id,))
+            conn.execute("DELETE FROM transactions WHERE id=?",(tx_id,))
             conn.commit()
             conn.close()
 
@@ -1232,21 +1464,17 @@ HƯỚNG DẪN:
                 }, 400)
                 return
 
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE goals
-                SET current = MIN(target, current + ?)
-                WHERE id = ?
-                """,
-                (amount, goal_id),
-            )
-            conn.commit()
-            conn.close()
-
-            self._send_json({"success": True})
-            return
+            conn=get_connection(); goal=conn.execute("SELECT * FROM goals WHERE id=?",(goal_id,)).fetchone()
+            if not goal: conn.close(); self._send_json({"success":False,"error":"Không tìm thấy mục tiêu."},404); return
+            balance=jar_balance_map(conn,current_month()).get("Tiết kiệm",0)
+            remaining=max(0,float(goal["target"])-float(goal["current"]))
+            amount=min(float(amount),remaining)
+            if amount<=0: conn.close(); self._send_json({"success":False,"error":"Mục tiêu đã đạt hoặc số tiền không hợp lệ."},400); return
+            if balance<amount:
+                conn.close(); self._send_json({"success":False,"error":f"Hũ Tiết kiệm chỉ còn {int(balance):,}đ, không đủ để nạp {int(amount):,}đ."},400); return
+            conn.execute("UPDATE goals SET current=current+? WHERE id=?",(amount,goal_id))
+            add_jar_movement(conn,"Tiết kiệm",-amount,"goal_transfer","goal",goal_id,current_month())
+            conn.commit(); conn.close(); self._send_json({"success":True}); return
 
         self._send_json({
             "error": "Unknown POST endpoint"
@@ -1260,6 +1488,7 @@ class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
 
 def run_server():
     init_sqlite_db()
+    threading.Thread(target=recurring_bill_worker, name="budgetpet-bill-worker", daemon=True).start()
 
     server_address = ("0.0.0.0", PORT)
     httpd = ReusableThreadingTCPServer(

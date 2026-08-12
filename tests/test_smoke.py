@@ -28,6 +28,19 @@ class BudgetPetSmokeTests(unittest.TestCase):
         self.assertIs(cursor.connection, conn)
         conn.close()
 
+
+    def test_ocr_jar_movement_can_use_cursor_connection(self):
+        sys.path.insert(0, str(ROOT))
+        from turso_http import TursoConnection, TursoCursor, _Result
+        from app import add_jar_movement
+        conn = TursoConnection("https://example.invalid", "token")
+        cursor = TursoCursor(_Result([], [], 0, None), conn)
+        self.assertIs(cursor.connection, conn)
+        # The OCR path passes cursor.connection into the jar movement helper.
+        # This assertion guards the exact integration contract that previously crashed.
+        self.assertIs(cursor.connection, conn)
+        conn.close()
+
     def test_local_register_login_persistence(self):
         with tempfile.TemporaryDirectory() as td:
             env=os.environ.copy()

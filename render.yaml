@@ -2,19 +2,25 @@ services:
   - type: web
     name: budgetpet
     runtime: docker
-    plan: starter
+    plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
     envVars:
-      - key: DATA_DIR
-        value: /data
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
         value: gemini-flash-latest
       - key: GEMINI_FALLBACK_MODELS
         value: gemini-3.1-flash-lite
-    disk:
-      name: budgetpet-data
-      mountPath: /data
-      sizeGB: 1
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: TURSO_ORG
+        sync: false
+      - key: TURSO_GROUP
+        value: default
+      - key: TURSO_PLATFORM_TOKEN
+        sync: false
+      - key: TURSO_TOKEN_EXPIRATION
+        value: 30d

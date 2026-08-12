@@ -14,6 +14,14 @@ import hashlib
 import hmac
 import calendar
 from http.cookies import SimpleCookie
+
+from turso_http import (
+    TursoDatabaseError,
+    TursoIntegrityError,
+    TursoOperationalError,
+    TursoPlatformAPI,
+    connect_turso,
+)
 from pathlib import Path
 from datetime import datetime
 from email.parser import BytesFeedParser
@@ -33,9 +41,24 @@ GEMINI_FALLBACK_MODELS = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MOD
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Persistent data root:
-# - Local development: ./database
-# - Render with Persistent Disk: set DATA_DIR=/data
+# Storage modes:
+# - Local development: standard sqlite3 files under ./database
+# - Turso remote: set TURSO_DATABASE_URL + TURSO_AUTH_TOKEN + Turso Platform API settings.
+# Turso remote mode keeps authentication in one database and provisions one isolated
+# Turso database per user. Turso's Free plan currently allows 100 databases, so the
+# 30-user demo fits comfortably within the advertised limit.
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+TURSO_ORG = os.environ.get("TURSO_ORG", "").strip()
+TURSO_PLATFORM_TOKEN = os.environ.get("TURSO_PLATFORM_TOKEN", "").strip()
+TURSO_GROUP = os.environ.get("TURSO_GROUP", "default").strip() or "default"
+TURSO_TOKEN_EXPIRATION = os.environ.get("TURSO_TOKEN_EXPIRATION", "30d").strip() or "30d"
+TURSO_PLATFORM_API_URL = os.environ.get("TURSO_PLATFORM_API_URL", "https://api.turso.tech").strip() or "https://api.turso.tech"
+_turso_config_present = any([TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TURSO_ORG, TURSO_PLATFORM_TOKEN])
+if _turso_config_present and not all([TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TURSO_ORG, TURSO_PLATFORM_TOKEN]):
+    raise RuntimeError("Turso chưa được cấu hình đầy đủ: cần TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TURSO_ORG và TURSO_PLATFORM_TOKEN.")
+TURSO_ENABLED = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN and TURSO_ORG and TURSO_PLATFORM_TOKEN)
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "database"))).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_DIR = DATA_DIR
@@ -54,6 +77,9 @@ DB_FILE = Path(os.environ.get("DB_FILE", str(DB_DIR / "budgetpet.db")))
 TEMPLATES_DIR = BASE_DIR / "templates"
 
 _REQUEST_CONTEXT = threading.local()
+_TURSO_USER_TOKEN_CACHE = {}
+_TURSO_USER_INIT_CACHE = set()
+_TURSO_CACHE_LOCK = threading.RLock()
 
 
 def json_response(handler, data, status=200):
@@ -75,6 +101,20 @@ def text_response(handler, text, status=200, content_type="text/plain; charset=u
 
 
 def get_connection(db_file=None):
+    if TURSO_ENABLED:
+        if db_file is None:
+            host = getattr(_REQUEST_CONTEXT, "db_host", "")
+            token = getattr(_REQUEST_CONTEXT, "db_token", "")
+            if not host or not token:
+                raise TursoOperationalError("Chưa có thông tin Turso database của tài khoản hiện tại.")
+            return connect_turso(host, token)
+        if isinstance(db_file, tuple) and len(db_file) == 2:
+            host, token = db_file
+            return connect_turso(host, token)
+        if isinstance(db_file, dict):
+            return connect_turso(db_file["host"], db_file["token"])
+        raise TursoOperationalError("TURSO mode yêu cầu database reference dạng (host, token).")
+
     if db_file is None:
         db_file = getattr(_REQUEST_CONTEXT, "db_file", None) or DB_FILE
     db_file = Path(db_file)
@@ -99,7 +139,7 @@ def current_user_db():
 
 
 def clear_request_context():
-    for attr in ("user_id", "db_file"):
+    for attr in ("user_id", "db_file", "db_host", "db_token"):
         if hasattr(_REQUEST_CONTEXT, attr):
             delattr(_REQUEST_CONTEXT, attr)
 
@@ -116,6 +156,8 @@ def verify_password(password, salt_hex, expected_hash):
 
 
 def get_auth_connection():
+    if TURSO_ENABLED:
+        return connect_turso(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
     AUTH_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(AUTH_DB_FILE), timeout=20)
     conn.row_factory = sqlite3.Row
@@ -138,6 +180,7 @@ def init_auth_db():
             password_hash TEXT NOT NULL,
             password_salt TEXT NOT NULL,
             user_db TEXT NOT NULL UNIQUE,
+            user_host TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -150,6 +193,9 @@ def init_auth_db():
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
     """)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "user_host" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN user_host TEXT")
     conn.commit()
     conn.close()
 
@@ -168,9 +214,12 @@ def create_user_database(path):
 
 
 def init_user_database(path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = get_connection(path)
+    if TURSO_ENABLED and isinstance(path, tuple):
+        conn = get_connection(path)
+    else:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = get_connection(path)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -339,6 +388,63 @@ def parse_cookie_token(handler):
         return ""
 
 
+def get_turso_platform():
+    if not (TURSO_ORG and TURSO_PLATFORM_TOKEN):
+        raise TursoOperationalError(
+            "Thiếu TURSO_ORG hoặc TURSO_PLATFORM_TOKEN. "
+            "Cần cấu hình để BudgetPet tự tạo database riêng cho mỗi tài khoản."
+        )
+    return TursoPlatformAPI(TURSO_ORG, TURSO_PLATFORM_TOKEN, api_base=TURSO_PLATFORM_API_URL)
+
+
+def _user_cache_key(row):
+    return str(row["user_db"])
+
+
+def get_user_remote_ref(row, force_refresh=False):
+    if not TURSO_ENABLED:
+        raise TursoOperationalError("TURSO mode chưa được bật.")
+    db_name = str(row["user_db"])
+    host = str(row["user_host"] or "")
+    if not host:
+        raise TursoOperationalError(f"Tài khoản {row['username']} chưa có Turso host.")
+    key = _user_cache_key(row)
+    now = datetime.now().timestamp()
+    with _TURSO_CACHE_LOCK:
+        cached = _TURSO_USER_TOKEN_CACHE.get(key)
+        if cached and not force_refresh and cached[1] > now:
+            return host, cached[0]
+    platform = get_turso_platform()
+    token = platform.create_database_token(db_name, expiration=TURSO_TOKEN_EXPIRATION)
+    with _TURSO_CACHE_LOCK:
+        _TURSO_USER_TOKEN_CACHE[key] = (token, now + 60 * 60 * 24 * 29)
+    return host, token
+
+
+def provision_turso_user_database():
+    platform = get_turso_platform()
+    db_name = f"budgetpet-user-{secrets.token_hex(10)}"
+    db = platform.create_database(db_name, TURSO_GROUP)
+    host = db.get("Hostname") or db.get("hostname")
+    if not host:
+        platform.delete_database(db_name)
+        raise TursoDatabaseError("Turso không trả về Hostname cho database người dùng.")
+    token = platform.create_database_token(db_name, expiration=TURSO_TOKEN_EXPIRATION)
+    with _TURSO_CACHE_LOCK:
+        _TURSO_USER_TOKEN_CACHE[db_name] = (token, datetime.now().timestamp() + 60 * 60 * 24 * 29)
+    return db_name, host, token
+
+
+def delete_turso_user_database(db_name):
+    if not db_name or not TURSO_ENABLED or not TURSO_ORG or not TURSO_PLATFORM_TOKEN:
+        return
+    try:
+        get_turso_platform().delete_database(db_name)
+    finally:
+        with _TURSO_CACHE_LOCK:
+            _TURSO_USER_TOKEN_CACHE.pop(db_name, None)
+
+
 def session_user(handler):
     token = parse_cookie_token(handler)
     if not token:
@@ -346,7 +452,7 @@ def session_user(handler):
     now = int(datetime.now().timestamp())
     conn = get_auth_connection()
     row = conn.execute("""
-        SELECT u.id, u.username, u.display_name, u.user_db, s.expires_at
+        SELECT u.id, u.username, u.display_name, u.user_db, u.user_host, s.expires_at
         FROM sessions s JOIN users u ON u.id = s.user_id
         WHERE s.token = ? AND s.expires_at > ?
     """, (token, now)).fetchone()
@@ -356,13 +462,26 @@ def session_user(handler):
         conn.close()
         return None
     conn.close()
+
     try:
-        db_path = user_db_path(row["user_db"])
-        init_user_database(db_path)
-    except Exception:
+        if TURSO_ENABLED:
+            db_ref = get_user_remote_ref(row)
+            cache_key = _user_cache_key(row)
+            if cache_key not in _TURSO_USER_INIT_CACHE:
+                init_user_database(db_ref)
+                _TURSO_USER_INIT_CACHE.add(cache_key)
+            _REQUEST_CONTEXT.user_id = int(row["id"])
+            _REQUEST_CONTEXT.db_host = db_ref[0]
+            _REQUEST_CONTEXT.db_token = db_ref[1]
+        else:
+            db_path = user_db_path(row["user_db"])
+            if not db_path.exists():
+                init_user_database(db_path)
+            _REQUEST_CONTEXT.user_id = int(row["id"])
+            _REQUEST_CONTEXT.db_file = db_path
+    except Exception as exc:
+        print("Session database error:", exc)
         return None
-    _REQUEST_CONTEXT.user_id = int(row["id"])
-    _REQUEST_CONTEXT.db_file = db_path
     return dict(row)
 
 
@@ -409,16 +528,13 @@ def prepare_database_file():
         backup = DB_FILE.with_name(f"{DB_FILE.stem}_corrupt_{stamp}{DB_FILE.suffix}")
         try:
             DB_FILE.rename(backup)
-            print(f"⚠️ Database không hợp lệ. Đã đổi tên bản cũ thành: {backup.name}")
+            print(f"Database invalid. Renamed old file to: {backup.name}")
         except OSError as exc:
-            print(f"⚠️ Không thể đổi tên database cũ: {exc}")
+            print(f"Could not rename old database: {exc}")
 
 
 def init_sqlite_db():
     init_auth_db()
-    # Compatibility helper: initialize the legacy local DB only when explicitly requested.
-    if current_user_db():
-        init_user_database(current_user_db())
 
 
 JAR_NAMES = [
@@ -520,9 +636,9 @@ def process_bill_payment(conn, bill_id, month_year=None, automatic=False):
     jar = bill["target_jar"] or "Nhu cầu thiết yếu"
     amount = int(bill["amount"] or 0)
     title = f"Hóa đơn định kỳ: {bill['title']}"
-    conn.execute("INSERT INTO transactions(merchant,title,amount,time,category,jar_name,source_type,source_id) VALUES(?,?,?,?,?,?,?,?)",
-                 (bill["title"], title, amount, datetime.now().strftime("%H:%M"), "Hóa đơn", jar, "recurring_bill", bill_id))
-    txid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    cur = conn.execute("INSERT INTO transactions(merchant,title,amount,time,category,jar_name,source_type,source_id) VALUES(?,?,?,?,?,?,?,?)",
+                       (bill["title"], title, amount, datetime.now().strftime("%H:%M"), "Hóa đơn", jar, "recurring_bill", bill_id))
+    txid = cur.lastrowid
     add_jar_movement(conn, jar, -amount, "expense", "bill", bill_id, month_year)
     conn.execute("INSERT INTO bill_payments(bill_id,month_year,transaction_id) VALUES(?,?,?)", (bill_id,month_year,txid))
     conn.execute("UPDATE bills SET paid=1 WHERE id=?", (bill_id,))
@@ -553,10 +669,14 @@ def process_due_bills_for_db(db_path, force_due=False):
 def process_all_due_bills():
     try:
         conn=get_auth_connection()
-        rows=conn.execute("SELECT user_db FROM users").fetchall(); conn.close()
+        rows=conn.execute("SELECT user_db, user_host FROM users").fetchall(); conn.close()
         for r in rows:
             try:
-                process_due_bills_for_db(user_db_path(r["user_db"]))
+                if TURSO_ENABLED:
+                    ref = get_user_remote_ref(r)
+                    process_due_bills_for_db(ref)
+                else:
+                    process_due_bills_for_db(user_db_path(r["user_db"]))
             except Exception as exc:
                 print("Scheduled bill error:", exc)
     except Exception as exc:
@@ -942,35 +1062,54 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             if not display_name:
                 display_name = username
             conn = get_auth_connection()
+            provisioned_name = None
             try:
-                conn.execute("BEGIN IMMEDIATE")
                 count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 if count >= MAX_DEMO_USERS:
-                    conn.rollback()
+                    conn.close()
                     self._send_json({"success": False, "error": f"Bản demo giới hạn {MAX_DEMO_USERS} tài khoản."}, 400)
                     return
                 salt, password_hash = hash_password(password)
-                db_rel = str((USERS_DIR / f"user_{secrets.token_hex(16)}.db").resolve())
+                if TURSO_ENABLED:
+                    db_name, db_host, db_token = provision_turso_user_database()
+                    provisioned_name = db_name
+                    db_value = db_name
+                else:
+                    db_name, db_host, db_token = None, None, None
+                    db_value = str((USERS_DIR / f"user_{secrets.token_hex(16)}.db").resolve())
                 cur = conn.execute(
-                    "INSERT INTO users(username, display_name, password_hash, password_salt, user_db) VALUES (?, ?, ?, ?, ?)",
-                    (username, display_name, password_hash, salt, db_rel),
+                    "INSERT INTO users(username, display_name, password_hash, password_salt, user_db, user_host) VALUES (?, ?, ?, ?, ?, ?)",
+                    (username, display_name, password_hash, salt, db_value, db_host),
                 )
                 user_id = cur.lastrowid
                 conn.commit()
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, TursoIntegrityError):
                 conn.rollback()
+                conn.close()
+                if provisioned_name:
+                    delete_turso_user_database(provisioned_name)
                 self._send_json({"success": False, "error": "Tên đăng nhập đã tồn tại."}, 409)
                 return
             except Exception as exc:
                 conn.rollback()
+                conn.close()
+                if provisioned_name:
+                    delete_turso_user_database(provisioned_name)
                 self._send_json({"success": False, "error": f"Không thể tạo tài khoản: {exc}"}, 500)
                 return
             finally:
-                conn.close()
+                try: conn.close()
+                except Exception: pass
             try:
-                user_db_file = Path(db_rel)
-                create_user_database(user_db_file)
-                user_conn = get_connection(user_db_file)
+                if TURSO_ENABLED:
+                    init_user_database((db_host, db_token))
+                    with _TURSO_CACHE_LOCK:
+                        _TURSO_USER_INIT_CACHE.add(db_name)
+                    user_conn = get_connection((db_host, db_token))
+                else:
+                    user_db_file = Path(db_value)
+                    create_user_database(user_db_file)
+                    user_conn = get_connection(user_db_file)
                 user_conn.execute(
                     "INSERT INTO settings(key,value) VALUES('display_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (display_name,)
@@ -990,6 +1129,8 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 conn = get_auth_connection()
                 conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
                 conn.commit(); conn.close()
+                if TURSO_ENABLED and provisioned_name:
+                    delete_turso_user_database(provisioned_name)
                 self._send_json({"success": False, "error": f"Không thể khởi tạo dữ liệu tài khoản: {exc}"}, 500)
             return
 
@@ -1507,18 +1648,22 @@ def run_server():
     )
 
     print("=" * 60)
-    print("🚀 BudgetPet đang chạy")
-    print(f"🌐 Trên máy tính: http://localhost:{PORT}")
-    print("📱 Điện thoại cùng Wi-Fi: dùng IP LAN của máy tính, ví dụ http://192.168.1.10:%d" % PORT)
+    print("BudgetPet dang chay")
+    print(f"Local: http://localhost:{PORT}")
+    print("Dien thoai cung Wi-Fi: dung IP LAN cua may tinh, vi du http://192.168.1.10:%d" % PORT)
     try:
         ip = socket.gethostbyname(socket.gethostname())
         if ip and not ip.startswith("127."):
-            print(f"   IP LAN phát hiện: {ip}")
+            print(f"LAN IP: {ip}")
     except Exception:
         pass
-    print(f"💾 Auth database: {AUTH_DB_FILE}")
-    print(f"👥 Demo limit: {MAX_DEMO_USERS} tài khoản; mỗi tài khoản có SQLite riêng trong {USERS_DIR}")
-    print("⛔ Nhấn Ctrl+C để dừng server")
+    if TURSO_ENABLED:
+        print("Storage: Turso Cloud (auth DB + 1 database/user)")
+        print(f"Demo limit: {MAX_DEMO_USERS} users; max 1 DB/user")
+    else:
+        print(f"Auth database: {AUTH_DB_FILE}")
+        print(f"Demo limit: {MAX_DEMO_USERS} users; each account has SQLite data in {USERS_DIR}")
+    print("Nhan Ctrl+C de dung server")
     print("=" * 60, flush=True)
 
     try:

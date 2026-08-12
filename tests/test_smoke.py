@@ -10,6 +10,15 @@ class BudgetPetSmokeTests(unittest.TestCase):
         proc=subprocess.run([sys.executable,'-m','py_compile',str(ROOT/'app.py')],capture_output=True,text=True)
         self.assertEqual(proc.returncode,0,proc.stderr)
 
+
+    def test_turso_float_parameter_json_type(self):
+        sys.path.insert(0, str(ROOT))
+        from turso_http import _encode_value
+        encoded = _encode_value(5000000.0)
+        self.assertEqual(encoded["type"], "float")
+        self.assertIsInstance(encoded["value"], float)
+        self.assertEqual(encoded["value"], 5000000.0)
+
     def test_local_register_login_persistence(self):
         with tempfile.TemporaryDirectory() as td:
             env=os.environ.copy()

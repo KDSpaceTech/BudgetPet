@@ -56,6 +56,11 @@ class TursoRow(dict):
 class TursoCursor:
     def __init__(self, result: _Result, connection=None):
         self._connection = connection
+
+    @property
+    def connection(self):
+        """sqlite3.Cursor-compatible access to the owning connection."""
+        return self._connection
         self._result = result
         self.description = [(name, None, None, None, None, None, None) for name in result.cols]
         self.rowcount = result.rowcount

@@ -19,6 +19,15 @@ class BudgetPetSmokeTests(unittest.TestCase):
         self.assertIsInstance(encoded["value"], float)
         self.assertEqual(encoded["value"], 5000000.0)
 
+
+    def test_turso_cursor_exposes_connection(self):
+        sys.path.insert(0, str(ROOT))
+        from turso_http import TursoConnection, TursoCursor, _Result
+        conn = TursoConnection("https://example.invalid", "token")
+        cursor = TursoCursor(_Result([], [], 0, None), conn)
+        self.assertIs(cursor.connection, conn)
+        conn.close()
+
     def test_local_register_login_persistence(self):
         with tempfile.TemporaryDirectory() as td:
             env=os.environ.copy()

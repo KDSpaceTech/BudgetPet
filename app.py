@@ -32,8 +32,13 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip() or 
 GEMINI_FALLBACK_MODELS = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite").split(",") if m.strip()]
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_DIR = BASE_DIR / "database"
-DB_DIR.mkdir(parents=True, exist_ok=True)
+
+# Persistent data root:
+# - Local development: ./database
+# - Render with Persistent Disk: set DATA_DIR=/data
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "database"))).expanduser()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_DIR = DATA_DIR
 USERS_DIR = DB_DIR / "users"
 USERS_DIR.mkdir(parents=True, exist_ok=True)
 AUTH_DB_FILE = Path(os.environ.get("AUTH_DB_FILE", str(DB_DIR / "auth.db")))
@@ -116,6 +121,10 @@ def get_auth_connection():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 20000")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError:
+        pass
     return conn
 
 
@@ -146,9 +155,10 @@ def init_auth_db():
 
 
 def user_db_path(user_db):
-    path = (BASE_DIR / user_db).resolve()
+    raw = Path(user_db)
+    path = (raw if raw.is_absolute() else BASE_DIR / raw).resolve()
     users_root = USERS_DIR.resolve()
-    if users_root not in path.parents:
+    if users_root != path.parent and users_root not in path.parents:
         raise ValueError("Đường dẫn database người dùng không hợp lệ")
     return path
 
@@ -940,7 +950,7 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json({"success": False, "error": f"Bản demo giới hạn {MAX_DEMO_USERS} tài khoản."}, 400)
                     return
                 salt, password_hash = hash_password(password)
-                db_rel = f"database/users/{secrets.token_hex(16)}.db"
+                db_rel = str((USERS_DIR / f"user_{secrets.token_hex(16)}.db").resolve())
                 cur = conn.execute(
                     "INSERT INTO users(username, display_name, password_hash, password_salt, user_db) VALUES (?, ?, ?, ?, ?)",
                     (username, display_name, password_hash, salt, db_rel),
@@ -958,7 +968,7 @@ class BudgetPetHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             finally:
                 conn.close()
             try:
-                user_db_file = BASE_DIR / db_rel
+                user_db_file = Path(db_rel)
                 create_user_database(user_db_file)
                 user_conn = get_connection(user_db_file)
                 user_conn.execute(
